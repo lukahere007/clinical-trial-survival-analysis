@@ -1,0 +1,429 @@
+---
+title: "Adjuvant levamisole and 5-FU in stage III colon cancer: survival reanalysis"
+author: "Luke Wamalwa"
+output:
+  github_document:
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.path = "../figures/", dpi = 150, fig.width = 8, fig.height = 5.5
+)
+suppressPackageStartupMessages({
+  library(survival)
+  library(ggplot2)
+  library(patchwork)
+  library(broom)
+  library(knitr)
+})
+for (f in list.files(file.path("..", "R"), pattern = "\\.R$", full.names = TRUE)) source(f)
+
+dat <- make_analysis_data(survival::colon)
+TAU <- 5        # pre-specified RMST horizon (years)
+TAU_SENS <- 7   # sensitivity horizon (S5)
+ARMS <- levels(dat$arm)
+
+# Pre-specified adjustment set (SAP 6.3)
+COVARS <- c("age", "sex", "node4", "extent", "differ", "obstruct", "perfor", "adhere", "surg")
+
+surv_formula <- function(ep, rhs) {
+  as.formula(paste0("Surv(", ep, "_time, ", ep, "_event) ~ ", rhs))
+}
+hr_arm <- function(fit, label, group) {
+  td <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE)
+  td <- td[grepl("^arm", td$term), ]
+  data.frame(group = group, analysis = label,
+             comparison = paste(sub("^arm", "", td$term), "vs Obs"),
+             estimate = td$estimate, conf.low = td$conf.low, conf.high = td$conf.high,
+             p = td$p.value, n = fit$n, events = fit$nevent)
+}
+logrank_pair <- function(ep, comp) {
+  d2 <- droplevels(dat[dat$arm %in% c("Obs", comp), ])
+  sd <- survdiff(surv_formula(ep, "arm"), data = d2)
+  pchisq(sd$chisq, df = 1, lower.tail = FALSE)
+}
+```
+
+This report follows the pre-specified [statistical analysis plan](../SAP.md). Code for every number is in this R Markdown file and in [`R/`](../R). Section numbers in brackets (e.g. *SAP 6.4*) point to the plan.
+
+## 1. Data
+
+`survival::colon` holds the patient-level data from the NCCTG/Intergroup trial of adjuvant therapy after resection of colon cancer (Moertel et al., *N Engl J Med* 1990; final report *Ann Intern Med* 1995). Patients were randomised to observation (Obs), levamisole alone (Lev) or levamisole + 5-fluorouracil (Lev+5FU). The dataset has two rows per patient (recurrence and death); `make_analysis_data()` reshapes it to one row per patient with three endpoints.
+
+```{r data-summary}
+ev <- data.frame(
+  Arm = c(ARMS, "Total"),
+  N = c(as.vector(table(dat$arm)), nrow(dat)),
+  Deaths = c(tapply(dat$os_event, dat$arm, sum), sum(dat$os_event)),
+  `RFS events` = c(tapply(dat$rfs_event, dat$arm, sum), sum(dat$rfs_event)),
+  Recurrences = c(tapply(dat$ttr_event, dat$arm, sum), sum(dat$ttr_event)),
+  `Deaths without recurrence` = c(tapply(dat$cr_status == "Death without recurrence", dat$arm, sum),
+                                  sum(dat$cr_status == "Death without recurrence")),
+  check.names = FALSE
+)
+fu <- survfit(Surv(os_time, 1 - os_event) ~ 1, data = dat)  # reverse KM for follow-up
+fu_med <- summary(fu)$table[c("median", "0.95LCL", "0.95UCL")]
+kable(ev, row.names = FALSE, caption = "Patients and events by arm (ITT).")
+```
+
+Median follow-up (reverse Kaplan–Meier) is `r sprintf("%.1f", fu_med[1])` years (95% CI `r sprintf("%.1f", fu_med[2])` to `r sprintf("%.1f", fu_med[3])`). Shortest follow-up among patients still alive: `r sprintf("%.1f", min(dat$os_time[dat$os_event == 0]))` years.
+
+## 2. Baseline characteristics (Table 1)
+
+```{r table1}
+kable(baseline_table(dat), align = "lrrrr",
+      caption = "Table 1. Baseline characteristics by randomised arm. n (%) of non-missing, or median (IQR).")
+```
+
+The arms are well balanced, as expected after randomisation. No baseline significance tests are reported (*SAP 6.1*).
+
+### Missing data (*SAP 6.5*)
+
+```{r missing}
+miss <- sapply(dat[, c(COVARS, "nodes")], function(x) tapply(is.na(x), dat$arm, sum))
+miss <- miss[, colSums(miss) > 0, drop = FALSE]
+n_cc <- sum(complete.cases(dat[, COVARS]))
+kable(cbind(Arm = rownames(miss), as.data.frame(miss)), row.names = FALSE,
+      caption = "Missing baseline values by arm (only variables with any missing shown).")
+nodes_inconsistent <- sum(!is.na(dat$nodes) & ((dat$nodes > 4) != (dat$node4 == ">4")))
+```
+
+Arm and all outcomes are complete. Differentiation is missing for `r sum(is.na(dat$differ))` patients, so the adjusted Cox model uses `r n_cc` of `r nrow(dat)` patients (complete cases); a missing-indicator analysis (S2) keeps everyone. The raw node count is missing for `r sum(is.na(dat$nodes))` patients and disagrees with the `node4` flag for another `r nodes_inconsistent` (a known inconsistency noted in the `survival` documentation), which is why the SAP adjusts for `node4` rather than the count.
+
+## 3. Overall survival (primary endpoint)
+
+```{r km-os, fig.height = 6.2}
+km_os <- survfit(Surv(os_time, os_event) ~ arm, data = dat)
+km_plot(km_os, "Overall survival by arm (ITT, n = 929)", "Overall survival")
+```
+
+```{r os-summary}
+km_summary <- function(fit, at = 5) {
+  tab <- summary(fit)$table
+  s5 <- summary(fit, times = at)
+  med <- ifelse(is.na(tab[, "median"]), "Not reached",
+                sprintf("%.1f (%s to %s)", tab[, "median"], sprintf("%.1f", tab[, "0.95LCL"]),
+                        ifelse(is.na(tab[, "0.95UCL"]), "NR", sprintf("%.1f", tab[, "0.95UCL"]))))
+  data.frame(Arm = sub("arm=", "", rownames(tab)), N = tab[, "n.max"], Events = tab[, "events"],
+             `Median, years (95% CI)` = med,
+             `5-year estimate (95% CI)` = sprintf("%.1f%% (%.1f to %.1f)", 100 * s5$surv,
+                                                    100 * s5$lower, 100 * s5$upper),
+             check.names = FALSE, row.names = NULL)
+}
+kable(km_summary(km_os), caption = "Overall survival: Kaplan-Meier summaries. NR = not reached.")
+```
+
+### Hierarchical testing of the confirmatory hypotheses (*SAP 5*)
+
+```{r hierarchy}
+fit_os  <- coxph(surv_formula("os", "arm"), data = dat)
+fit_rfs <- coxph(surv_formula("rfs", "arm"), data = dat)
+hr_os <- hr_arm(fit_os, "Unadjusted", "OS")
+hr_rfs <- hr_arm(fit_rfs, "Unadjusted", "RFS")
+
+hyp <- data.frame(
+  Hypothesis = c("H1", "H2", "H3", "H4"),
+  Endpoint = c("OS", "RFS", "OS", "RFS"),
+  Comparison = c("Lev+5FU vs Obs", "Lev+5FU vs Obs", "Lev vs Obs", "Lev vs Obs"),
+  stringsAsFactors = FALSE
+)
+hyp$p <- mapply(function(ep, cmp) logrank_pair(tolower(ep), sub(" vs Obs", "", cmp)),
+                hyp$Endpoint, hyp$Comparison)
+hrs <- rbind(hr_os, hr_rfs)
+hyp$hr <- mapply(function(ep, cmp) {
+  r <- hrs[hrs$group == ep & hrs$comparison == cmp, ]
+  fmt_ci(r$estimate, r$conf.low, r$conf.high)
+}, hyp$Endpoint, hyp$Comparison)
+# Fixed-sequence procedure: test only while every earlier hypothesis was rejected.
+gate <- TRUE
+hyp$Decision <- NA_character_
+for (i in seq_len(nrow(hyp))) {
+  if (!gate) { hyp$Decision[i] <- "Not tested (descriptive only)"; next }
+  if (hyp$p[i] < 0.05) hyp$Decision[i] <- "Rejected" else {
+    hyp$Decision[i] <- "Not rejected"; gate <- FALSE
+  }
+}
+out <- hyp
+out$`Log-rank p` <- fmt_p(out$p)
+out$`HR (95% CI)` <- out$hr
+kable(out[, c("Hypothesis", "Endpoint", "Comparison", "HR (95% CI)", "Log-rank p", "Decision")],
+      row.names = FALSE,
+      caption = "Fixed-sequence testing at two-sided alpha = 0.05. HR from the unadjusted three-arm Cox model; p from the pairwise log-rank test.")
+
+h1 <- hr_os[hr_os$comparison == "Lev+5FU vs Obs", ]
+global_lr <- survdiff(Surv(os_time, os_event) ~ arm, data = dat)
+```
+
+- **H1 (OS, Lev+5FU vs Obs):** HR `r fmt_ci(h1$estimate, h1$conf.low, h1$conf.high)`, log-rank `r fmt_p_eq(hyp$p[1])`. Assignment to Lev+5FU reduced the hazard of death by about `r round(100 * (1 - h1$estimate))`% relative to observation.
+- The three-arm log-rank test gives χ² = `r sprintf("%.1f", global_lr$chisq)` on 2 df (p = `r fmt_p(pchisq(global_lr$chisq, 2, lower.tail = FALSE))`); it is shown for completeness and is not part of the testing hierarchy.
+
+## 4. Recurrence-free survival (key secondary)
+
+```{r km-rfs, fig.height = 6.2}
+km_rfs <- survfit(Surv(rfs_time, rfs_event) ~ arm, data = dat)
+km_plot(km_rfs, "Recurrence-free survival by arm (ITT, n = 929)", "Recurrence-free survival")
+```
+
+```{r rfs-summary}
+kable(km_summary(km_rfs), caption = "Recurrence-free survival: Kaplan-Meier summaries.")
+```
+
+The Lev+5FU curve separates from the other two within the first year and the gap is built up mainly over the first two to three years, when most recurrences occur; after that the curves run roughly parallel. For overall survival the separation starts later (around 1.5 to 2 years), as expected when deaths follow recurrences.
+
+## 5. Restricted mean survival time (*SAP 6.3*)
+
+The RMST is the area under the Kaplan–Meier curve up to τ. The difference between arms is the average event-free time gained in the first τ years. Unlike the HR it does not need proportional hazards, and it is in units a clinician can use.
+
+```{r rmst}
+rmst_tab <- do.call(rbind, lapply(c(TAU, TAU_SENS), function(tau) {
+  do.call(rbind, lapply(c("os", "rfs"), function(ep) {
+    do.call(rbind, lapply(c("Lev+5FU", "Lev"), function(cmp) {
+      r <- rmst_diff(dat[[paste0(ep, "_time")]], dat[[paste0(ep, "_event")]], dat$arm,
+                     tau = tau, ref = "Obs", comparator = cmp)
+      cbind(endpoint = toupper(ep), r)
+    }))
+  }))
+}))
+rmst_out <- data.frame(
+  `tau (years)` = rmst_tab$tau,
+  Endpoint = rmst_tab$endpoint,
+  Comparison = rmst_tab$comparison,
+  `RMST Obs (y)` = sprintf("%.2f", rmst_tab$rmst_ref),
+  `RMST comparator (y)` = sprintf("%.2f", rmst_tab$rmst_comp),
+  `Difference, months (95% CI)` = fmt_ci(12 * rmst_tab$diff, 12 * rmst_tab$lower, 12 * rmst_tab$upper, 1),
+  p = fmt_p(rmst_tab$p),
+  check.names = FALSE
+)
+kable(rmst_out, caption = "RMST by arm and difference vs observation. tau = 5 years is pre-specified; tau = 7 years is sensitivity analysis S5.")
+r_os5 <- rmst_tab[rmst_tab$tau == TAU & rmst_tab$endpoint == "OS" & rmst_tab$comparison == "Lev+5FU vs Obs", ]
+r_rfs5 <- rmst_tab[rmst_tab$tau == TAU & rmst_tab$endpoint == "RFS" & rmst_tab$comparison == "Lev+5FU vs Obs", ]
+```
+
+Over the first 5 years, patients assigned to Lev+5FU lived on average `r sprintf("%.1f", 12 * r_os5$diff)` months longer (95% CI `r sprintf("%.1f", 12 * r_os5$lower)` to `r sprintf("%.1f", 12 * r_os5$upper)`) and spent `r sprintf("%.1f", 12 * r_rfs5$diff)` more months recurrence-free (95% CI `r sprintf("%.1f", 12 * r_rfs5$lower)` to `r sprintf("%.1f", 12 * r_rfs5$upper)`) than patients under observation. Note that a 5-year RMST cannot exceed 60 months, so a few months is a meaningful gain at the population level.
+
+## 6. Adjusted Cox models and sensitivity analyses
+
+```{r adjusted}
+rhs_adj <- paste(c("arm", COVARS), collapse = " + ")
+rhs_mi  <- paste(c("arm", sub("^differ$", "differ_mi", COVARS)), collapse = " + ")
+
+fits <- list()
+for (ep in c("os", "rfs")) {
+  fits[[ep]] <- list(
+    unadj = coxph(surv_formula(ep, "arm"), data = dat),
+    adj   = coxph(surv_formula(ep, rhs_adj), data = dat),
+    mi    = coxph(surv_formula(ep, rhs_mi), data = dat)
+  )
+}
+```
+
+The adjusted OS model (complete cases, n = `r fits$os$adj$n`, `r fits$os$adj$nevent` deaths):
+
+```{r forest-adjusted, fig.height = 6}
+nice_term <- function(term) {
+  map <- c(
+    "armLev" = "Lev vs Obs", "armLev+5FU" = "Lev+5FU vs Obs", "age" = "Age (per year)",
+    "sexMale" = "Male vs female", "node4>4" = ">4 positive nodes vs 1-4",
+    "extentSerosa" = "Extent: serosa vs submucosa/muscle",
+    "extentContiguous structures" = "Extent: contiguous structures vs submucosa/muscle",
+    "differModerate" = "Differentiation: moderate vs well",
+    "differPoor" = "Differentiation: poor vs well",
+    "obstructYes" = "Obstruction", "perforYes" = "Perforation",
+    "adhereYes" = "Adherence to nearby organs", "surgLong" = "Long time from surgery"
+  )
+  unname(ifelse(term %in% names(map), map[term], term))
+}
+td <- broom::tidy(fits$os$adj, exponentiate = TRUE, conf.int = TRUE)
+td$label <- nice_term(gsub("`", "", td$term))
+td$group <- ifelse(grepl("^arm", td$term), "Treatment", "Baseline covariates")
+td$group <- factor(td$group, levels = c("Treatment", "Baseline covariates"))
+forest_plot(td, "Adjusted Cox model for overall survival (complete cases)")
+```
+
+### Proportional-hazards checks (*SAP 6.4*)
+
+```{r zph}
+zph_tab <- function(fit, model, ep) {
+  z <- cox.zph(fit)$table
+  data.frame(Endpoint = ep, Model = model, Term = rownames(z),
+             `Chi-sq` = sprintf("%.2f", z[, "chisq"]), df = z[, "df"],
+             p = fmt_p(z[, "p"]), check.names = FALSE, row.names = NULL)
+}
+zph_all <- rbind(
+  zph_tab(fits$os$unadj, "Unadjusted", "OS"),
+  zph_tab(fits$rfs$unadj, "Unadjusted", "RFS"),
+  zph_tab(fits$os$adj, "Adjusted", "OS"),
+  zph_tab(fits$rfs$adj, "Adjusted", "RFS")
+)
+kable(zph_all, caption = "Grambsch-Therneau tests on scaled Schoenfeld residuals (cox.zph, KM time transform).")
+
+flagged <- lapply(c(os = "os", rfs = "rfs"), function(ep) {
+  z <- cox.zph(fits[[ep]]$adj)$table
+  z <- z[rownames(z) != "GLOBAL", , drop = FALSE]
+  setdiff(rownames(z)[z[, "p"] < 0.05], "arm")
+})
+arm_p <- sapply(c("os", "rfs"), function(ep) cox.zph(fits[[ep]]$unadj)$table["arm", "p"])
+```
+
+```{r schoenfeld, fig.height = 6.5}
+schoen_df <- function(fit, keep) {
+  z <- cox.zph(fit, terms = FALSE, transform = "identity")
+  cols <- intersect(keep, colnames(z$y))
+  do.call(rbind, lapply(cols, function(cn)
+    data.frame(time = z$x, resid = z$y[, cn], term = cn)))
+}
+sd_trt <- schoen_df(fits$os$adj, c("armLev+5FU", "armLev"))
+sd_cov <- schoen_df(fits$os$adj, c("node4>4", "differPoor", "obstructYes"))
+sd <- rbind(sd_trt, sd_cov)
+sd$term <- factor(nice_term(sd$term), levels = nice_term(c("armLev+5FU", "armLev", "node4>4",
+                                                             "differPoor", "obstructYes")))
+coefs <- coef(fits$os$adj)
+names(coefs) <- nice_term(gsub("`", "", names(coefs)))
+hline <- data.frame(term = factor(levels(sd$term), levels = levels(sd$term)),
+                    beta = coefs[levels(sd$term)])
+ggplot(sd, aes(time, resid)) +
+  geom_point(colour = "#b5b4ad", size = 0.6, alpha = 0.7) +
+  geom_hline(data = hline, aes(yintercept = beta), colour = "#888888", linetype = "dashed") +
+  geom_smooth(method = "loess", formula = y ~ x, colour = "#2a78d6", fill = "#2a78d6",
+              alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~ term, scales = "free_y", ncol = 3) +
+  labs(title = "Scaled Schoenfeld residuals, adjusted OS model",
+       subtitle = "A flat smooth at the dashed line (the fitted log-HR) means a constant hazard ratio",
+       x = "Years since randomisation", y = "Estimated log hazard ratio over time") +
+  theme_report()
+```
+
+**Reading the diagnostics.**
+
+- **Treatment:** no evidence against proportional hazards (unadjusted model: OS p = `r fmt_p(arm_p["os"])`, RFS p = `r fmt_p(arm_p["rfs"])`). The Lev+5FU smooth drifts from slightly above its fitted log-HR in the first year to slightly below it around year 3, which matches the OS curves separating only after about 1.5 years, but the test is not significant (adjusted OS model: p = `r fmt_p(cox.zph(fits$os$adj)$table["arm", "p"])`). The HR is a reasonable single summary; the RMST difference (Section 5) and the piecewise HRs (S4) are reported alongside it so the conclusion does not rest on the PH assumption.
+- **Covariates:** `r paste(flagged$os, collapse = ", ")` (OS) and `r paste(flagged$rfs, collapse = ", ")` (RFS) have p < 0.05. Their residual smooths sit above the fitted log-HR in roughly the first two years and below it afterwards: the prognostic effect of many positive nodes, poor differentiation and obstruction is strongest early. The late upturns for differentiation and obstruction rest on few events and wide bands. As pre-specified, the adjusted models are refitted **stratified** on these covariates (S3), which removes the PH assumption for them while still estimating a treatment HR.
+
+```{r sensitivity}
+for (ep in c("os", "rfs")) {
+  covs_ns <- setdiff(COVARS, flagged[[ep]])
+  rhs_strat <- paste(c("arm", covs_ns, paste0("strata(", paste(flagged[[ep]], collapse = ", "), ")")),
+                     collapse = " + ")
+  fits[[ep]]$strat <- coxph(surv_formula(ep, rhs_strat), data = dat)
+}
+
+# S4: piecewise treatment HR, 0-2 years and beyond 2 years.
+piecewise <- function(ep) {
+  sp <- survSplit(surv_formula(ep, "arm"), data = dat, cut = 2, episode = "period",
+                  start = "tstart", end = "tstop", event = "event")
+  sp$period <- factor(sp$period, labels = c("0-2 years", ">2 years"))
+  for (a in c("Lev", "Lev+5FU")) for (pp in levels(sp$period)) {
+    sp[[paste(a, pp, sep = "|")]] <- as.integer(sp$arm == a & sp$period == pp)
+  }
+  vars <- grep("\\|", names(sp), value = TRUE)
+  f <- as.formula(paste("Surv(tstart, tstop, event) ~", paste0("`", vars, "`", collapse = " + ")))
+  fit <- coxph(f, data = sp)
+  td <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE)
+  parts <- do.call(rbind, strsplit(gsub("`", "", td$term), "|", fixed = TRUE))
+  data.frame(group = toupper(ep), analysis = paste0("S4 Piecewise, ", parts[, 2]),
+             comparison = paste(parts[, 1], "vs Obs"),
+             estimate = td$estimate, conf.low = td$conf.low, conf.high = td$conf.high,
+             p = td$p.value, n = nrow(dat), events = fit$nevent)
+}
+
+sens <- do.call(rbind, lapply(c("os", "rfs"), function(ep) {
+  g <- toupper(ep)
+  rbind(
+    hr_arm(fits[[ep]]$unadj, "Primary: unadjusted", g),
+    hr_arm(fits[[ep]]$adj, "S1 Adjusted, complete cases", g),
+    hr_arm(fits[[ep]]$mi, "S2 Adjusted, missing indicator", g),
+    hr_arm(fits[[ep]]$strat, "S3 Adjusted, stratified on non-PH covariates", g),
+    piecewise(ep)
+  )
+}))
+sens_out <- sens
+sens_out$`HR (95% CI)` <- fmt_ci(sens$estimate, sens$conf.low, sens$conf.high)
+sens_out$p <- fmt_p(sens$p)
+names(sens_out)[names(sens_out) == "group"] <- "Endpoint"
+kable(sens_out[, c("Endpoint", "comparison", "analysis", "n", "events", "HR (95% CI)", "p")],
+      row.names = FALSE, col.names = c("Endpoint", "Comparison", "Analysis", "n", "Events", "HR (95% CI)", "Wald p"),
+      caption = "Treatment hazard ratios across the primary and sensitivity analyses. For S4, events counts all events in the model.")
+```
+
+```{r forest-sensitivity, fig.height = 6.5}
+fs <- sens[sens$comparison == "Lev+5FU vs Obs", ]
+fs$label <- fs$analysis
+fs$group <- factor(fs$group, levels = c("OS", "RFS"))
+forest_plot(fs, "Lev+5FU vs Obs: hazard ratio is stable across pre-specified analyses")
+```
+
+```{r sens-numbers}
+rng <- function(ep) {
+  x <- sens[sens$group == ep & sens$comparison == "Lev+5FU vs Obs" & !grepl("^S4", sens$analysis), "estimate"]
+  sprintf("%.2f to %.2f", min(x), max(x))
+}
+pw <- sens[sens$comparison == "Lev+5FU vs Obs" & grepl("^S4", sens$analysis), ]
+```
+
+Across the unadjusted and adjusted analyses (S1–S3) the Lev+5FU vs Obs HR ranges from `r rng("OS")` for OS and `r rng("RFS")` for RFS. The piecewise estimates (S4) are OS `r fmt_ci(pw$estimate[pw$group == "OS"][1], pw$conf.low[pw$group == "OS"][1], pw$conf.high[pw$group == "OS"][1])` in years 0–2 and `r fmt_ci(pw$estimate[pw$group == "OS"][2], pw$conf.low[pw$group == "OS"][2], pw$conf.high[pw$group == "OS"][2])` after 2 years; RFS `r fmt_ci(pw$estimate[pw$group == "RFS"][1], pw$conf.low[pw$group == "RFS"][1], pw$conf.high[pw$group == "RFS"][1])` and `r fmt_ci(pw$estimate[pw$group == "RFS"][2], pw$conf.low[pw$group == "RFS"][2], pw$conf.high[pw$group == "RFS"][2])`. The confidence intervals of the two periods overlap widely, so these do not show that the effect changes over time; the study was not designed to detect that.
+
+## 7. Recurrence with death as a competing risk (*SAP 6.6*)
+
+```{r cif, fig.height = 4.8}
+cif <- survfit(Surv(ttr_time, cr_status) ~ arm, data = dat)
+cif_df <- do.call(rbind, lapply(seq_along(cif$strata), function(i) {
+  idx <- if (i == 1) seq_len(cif$strata[1]) else
+    (sum(cif$strata[seq_len(i - 1)]) + 1):sum(cif$strata[seq_len(i)])
+  arm <- sub("arm=", "", names(cif$strata)[i])
+  rbind(
+    data.frame(time = c(0, cif$time[idx]), cif = c(0, cif$pstate[idx, 2]), state = "Recurrence", arm = arm),
+    data.frame(time = c(0, cif$time[idx]), cif = c(0, cif$pstate[idx, 3]), state = "Death without recurrence", arm = arm)
+  )
+}))
+cif_df$arm <- factor(cif_df$arm, levels = ARMS)
+cif_df$state <- factor(cif_df$state, levels = c("Recurrence", "Death without recurrence"))
+ggplot(cif_df, aes(time, cif, colour = arm, linetype = arm)) +
+  geom_step(linewidth = 0.8) +
+  facet_wrap(~ state) +
+  scale_colour_manual(values = ARM_COLOURS, name = NULL) +
+  scale_linetype_manual(values = ARM_LINETYPES, name = NULL) +
+  scale_y_continuous(labels = function(x) paste0(round(100 * x), "%"), limits = c(0, 0.6)) +
+  scale_x_continuous(breaks = 0:9) +
+  labs(title = "Cumulative incidence (Aalen-Johansen)", x = "Years since randomisation",
+       y = "Cumulative incidence") +
+  theme_report()
+```
+
+```{r cif-table}
+s5 <- summary(cif, times = TAU)
+cif_tab <- data.frame(
+  Arm = ARMS,
+  `Recurrence by 5 years (95% CI)` = sprintf("%.1f%% (%.1f to %.1f)", 100 * s5$pstate[, 2],
+                                             100 * s5$lower[, 2], 100 * s5$upper[, 2]),
+  `Death without recurrence by 5 years (95% CI)` = sprintf("%.1f%% (%.1f to %.1f)", 100 * s5$pstate[, 3],
+                                                           100 * s5$lower[, 3], 100 * s5$upper[, 3]),
+  check.names = FALSE
+)
+kable(cif_tab, caption = "Aalen-Johansen cumulative incidence at 5 years.")
+fit_cs <- coxph(Surv(ttr_time, ttr_event) ~ arm, data = dat)
+cs <- hr_arm(fit_cs, "Cause-specific", "TTR")
+cs5 <- cs[cs$comparison == "Lev+5FU vs Obs", ]
+```
+
+Deaths without prior recurrence are uncommon (`r sum(dat$cr_status == "Death without recurrence")` of `r nrow(dat)` patients) and similar across arms, so competing risks barely change the picture here. The cause-specific HR for recurrence, Lev+5FU vs Obs, is `r fmt_ci(cs5$estimate, cs5$conf.low, cs5$conf.high)` (`r fmt_p_eq(cs5$p)`). This is a hazard ratio among patients still alive and recurrence-free; it is not a ratio of cumulative incidences.
+
+## 8. Conclusions
+
+1. **Primary (H1).** Assignment to Lev+5FU improved overall survival compared with observation: HR `r fmt_ci(h1$estimate, h1$conf.low, h1$conf.high)`, log-rank `r fmt_p_eq(hyp$p[1])`, and `r sprintf("%.1f", 12 * r_os5$diff)` months more life on average over the first 5 years.
+2. **Key secondary (H2).** Recurrence-free survival was also improved (HR `r hyp$hr[2]`, log-rank `r fmt_p_eq(hyp$p[2])`).
+3. **Levamisole alone (H3).** `r if (hyp$Decision[3] == "Rejected") "Levamisole alone also improved overall survival." else paste0("No evidence that levamisole alone improves overall survival (HR ", hyp$hr[3], ", log-rank ", fmt_p_eq(hyp$p[3]), "). The testing sequence stops here, so H4 is descriptive only.")`
+4. **Robustness.** The Lev+5FU effect is stable under covariate adjustment, missing-data handling and stratification on covariates that violate proportional hazards, and the treatment effect itself shows no evidence of non-proportional hazards.
+
+These conclusions agree qualitatively with the published trial reports, which found a benefit of levamisole plus fluorouracil and no clear benefit of levamisole alone. The numbers here are from the version of the data in the `survival` package and are not meant to reproduce the published tables exactly.
+
+<details>
+<summary>Session info</summary>
+
+```{r session}
+cat(R.version.string, "\n")
+pk <- c("survival", "ggplot2", "patchwork", "broom", "knitr", "rmarkdown")
+cat(paste0(pk, " ", vapply(pk, function(p) as.character(packageVersion(p)), ""), collapse = "\n"))
+```
+
+</details>

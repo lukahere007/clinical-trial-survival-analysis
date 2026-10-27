@@ -1,0 +1,16 @@
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# knitr / rmarkdown intermediates (the rendered .md and figures/ ARE committed)
+*.html
+analysis/*_cache/
+analysis/*_files/
+analysis/*.knit.md
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
